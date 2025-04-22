@@ -1,5 +1,5 @@
 ---
-title: "hyperparameter-tuning"
+title: "Lab 8 Machine Learning - Miranda Chin"
 format: html
 ---
 
