@@ -2,7 +2,7 @@
 title: "Lab 8 Machine Learning - Miranda Chin"
 format:
   html:
-    self-contained: true 
+    self-contained: true
 
 ---
 
