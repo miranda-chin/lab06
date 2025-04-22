@@ -1,0 +1,236 @@
+---
+title: "hyperparameter-tuning"
+format: html
+---
+
+Data Import/Tidy/Transform
+```{r}
+#Library loading
+library(tidyverse)
+library(tidymodels)
+library(powerjoin)
+library(glue)
+library(vip)
+library(baguette)
+
+#Data Ingest
+root  <- 'https://gdex.ucar.edu/dataset/camels/file'
+download.file('https://gdex.ucar.edu/dataset/camels/file/camels_attributes_v2.0.pdf', 
+              'data/camels_attributes_v2.0.pdf')
+types <- c("clim", "geol", "soil", "topo", "vege", "hydro")
+remote_files  <- glue('{root}/camels_{types}.txt')
+local_files   <- glue('data/camels_{types}.txt')
+walk2(remote_files, local_files, download.file, quiet = TRUE)
+camels <- map(local_files, read_delim, show_col_types = FALSE) 
+camels <- power_full_join(camels ,by = 'gauge_id')
+
+#Data Cleaning
+visdat::vis_dat(camels)
+skimr::skim(camels, geol_2nd_class)
+
+camels_clean <- drop_na(camels)
+
+
+```
+
+Data Splitting
+```{r}
+#Initial split
+set.seed(330)
+camels_clean <- camels_clean |> 
+  mutate(logQmean = log(q_mean))
+camels_split <- initial_split(camels_clean, prop = 0.8)
+
+#Testing/training
+camels_train <- training(camels_split)
+camels_test  <- testing(camels_split)
+```
+
+Feature Engineering
+```{r}
+#Proper recipe
+rec <-  recipe(logQmean ~ p_mean + pet_mean, data = camels_train) %>%
+  step_log(all_predictors()) %>%
+  step_interact(terms = ~ p_mean:pet_mean) |> 
+  step_naomit(all_predictors(), all_outcomes())
+```
+
+Data Resampling and Model Training
+```{r}
+#Cross Validation Dataset (k-folds)
+camels_cv <- vfold_cv(camels_train, v = 10)
+
+#Define Three Regression Models
+#Linear regression model
+lm_model <- linear_reg() %>%
+  set_engine("lm") %>%
+  set_mode("regression")
+
+#Xgboost regression model
+xgb_model <- boost_tree() %>% 
+  set_engine("xgboost") %>% 
+  set_mode("regression")
+
+#Neural network model
+nn_model <- bag_mlp() %>%
+  set_engine("nnet") %>% 
+  set_mode("regression")
+
+#Workflow Set/Map/Autoplot
+lm_wf <- workflow() %>%
+  add_recipe(rec) %>%
+  add_model(lm_model) %>%
+  fit(data = camels_train) 
+
+xgb_wf <- workflow() %>%
+  add_recipe(rec) %>%
+  add_model(nn_model) %>%
+  fit(data = camels_train) 
+
+nn_wf <- workflow() %>%
+  add_recipe(rec) %>%
+  add_model(nn_model) %>%
+  fit(data = camels_train) 
+
+wf <- workflow_set(
+  preproc = list(recipe1 = rec),
+  models = list(
+    linear = linear_reg() %>% set_engine("lm") %>% set_mode("regression"),
+    xgb = boost_tree() %>% set_engine("xgboost") %>% set_mode("regression"),
+    nn = mlp() %>% set_engine("nnet") %>% set_mode("regression")
+  )
+) %>%
+  workflow_map("fit_resamples", resamples = camels_cv)
+
+autoplot(wf)
+
+#Model Selection with Justification
+rank_results(wf, rank_metric = "rsq", select_best = TRUE)
+
+#I would choose the neural network model as it is ranked the most accurate model as it has the lowest Root Mean Squared Error, which means it has the lowest possibility of of predicting inaccurate values. It also has the highest R squared and explains the most variation in the data. This particular model might be the best fit because it isn't as limited as a linear model might be and doesn't need to be as fitted as a boosted tree model. 
+```
+
+Model Tuning
+```{r}
+#Tunable model setup
+nn_tune_model <- mlp(
+  hidden_units = tune(), 
+  penalty = tune()) %>%
+  set_engine("nnet") %>%
+  set_mode("regression")
+
+#Tunable workflow defined
+nn_tune_wf <- workflow() %>%
+  add_model(nn_tune_model) %>%
+  add_recipe(rec) 
+
+#Description of dial ranges
+dials <- extract_parameter_set_dials(nn_tune_wf)
+dials$object
+
+#Defined Search Space
+my.grid <- grid_latin_hypercube(
+  hidden_units(),
+  penalty(),
+  size = 25)
+
+glimpse(my.grid)
+
+#Executed Tune Grid
+model_params <-  tune_grid(
+    nn_tune_wf,
+    resamples = camels_cv,
+    grid = my.grid,
+    metrics = metric_set(rmse, rsq, mae),
+    control = control_grid(save_pred = TRUE))
+
+autoplot(model_params)
+#In this model, the Mean Absolute Error is relatively consistent, while the Root Mean Squared Error and R squared have more variation. This might mean that the model is not perfectly fitted to analyze the data, but that we should aim for 2.5 to 6 for hidden units as this is where the points were the most consistent, as well as -6 to -3 for the amount of regularization for the same reasons.
+
+```
+
+Check the skill of the tuned model	
+```{r}
+#Collect Metrics/Show Best/Describe in Plain Language	
+metrics_tbl <- collect_metrics(model_params)
+print(metrics_tbl)
+#It looks like Model 2 has the highest R squared and lowest MAE, making it the most accurate model for the metrics.
+
+show_best(model_params, metric = "mae", n = 5)
+#By organizing for MAE, Model 22 is ranked the best with the lowest MAE indicating that it is the best model to use. It seems like hidden units is the best parameter to use as it is relatively low, meaning that it may be less complex but will avoid being overfitted. Penalty is 3.28e-02 in comparison. 
+
+hp_best <- select_best(model_params, metric = "mae")
+```
+
+Finalize your model
+```{r}
+#Finalize workflow
+final_nn_wf <- finalize_workflow(
+  nn_tune_wf,
+  hp_best)
+
+```
+
+Final model verification
+```{r}
+#Implement the last fit
+final_model_fit <- last_fit(
+  final_nn_wf,
+  split = camels_split)
+  
+#Interpret Metrics
+collect_metrics(final_model_fit)
+#The RMSE of the model is 0.621, meaning that on average the predictions are off by 0.621 units. The R squared is 0.778 which means that the model explains about 78% of variance in the data.
+
+collect_predictions(final_model_fit)
+
+#Plot Predictions
+final_predictions <- collect_predictions(final_model_fit)
+
+ggplot(final_predictions, aes(x = .pred, y = logQmean)) +
+  geom_point(color = "purple", alpha = 0.5) + 
+  geom_smooth(method = "lm", se = FALSE, color = "blue", linetype = "dashed") + 
+  geom_abline(slope = 1, intercept = 0, color = "green", linetype = "solid") +
+  labs(
+    title = "Predicted vs Actual Values for Neural Network Model",
+    x = "Predicted Values",
+    y = "Actual Values") +
+  theme_minimal()
+
+```
+
+Final Figure
+```{r}
+#Augment Data & Calculate Residuals
+final_workflow <- extract_workflow(final_model_fit)
+nn_preds <- predict(final_workflow, new_data = camels_clean)
+
+aug_predictions <- bind_cols(camels_clean, nn_preds)
+glimpse(aug_predictions)
+
+aug_predictions <- aug_predictions %>%
+  mutate(residual = (logQmean - .pred)^2) 
+
+#Map Predicted Q and Residuals
+library(patchwork)
+
+prediction_map <- ggplot(aug_predictions, aes(x = gauge_lon, y = gauge_lat, color = .pred)) +
+  geom_point() +
+  scale_color_gradient(low = "lightblue", high = "darkred", name = "Predicted") +
+  labs(title = "Predicted logQmean") +
+  coord_fixed() +
+  theme_minimal()
+
+residual_map <- ggplot(aug_predictions, aes(x = gauge_lon, y = gauge_lat, color = residual)) +
+  geom_point() +
+  scale_color_gradient(low = "lightblue", high = "darkred", name = "Residual") +
+  labs(title = "Residuals") +
+  coord_fixed() +
+  theme_minimal()
+
+prediction_map + residual_map
+
+```
+
+
+
